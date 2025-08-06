@@ -9,6 +9,8 @@ __pycache__/
 
 *.pth
 
+training_periods/
+
 
 # Distribution / packaging
 .Python

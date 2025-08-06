@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,7 +6,8 @@ from StockFormer import create_compiled_stockformer
 import numpy as np
 import matplotlib.pyplot as plt
 import yaml
-
+import os
+from torch.amp import autocast, GradScaler
 
 def masked_mae(preds, labels, null_val=np.nan):
     """
@@ -16,7 +16,7 @@ def masked_mae(preds, labels, null_val=np.nan):
     if np.isnan(null_val):
         mask = ~torch.isnan(labels)
     else:
-        mask = (labels!=null_val)
+        mask = (labels != null_val)
     mask = mask.float()
     mask /=  torch.mean((mask))
     mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
@@ -60,7 +60,7 @@ class MultiSupervisionLoss(nn.Module):
 
 
 def train_period(period_data, model, optimizer, criterion, device, num_epochs, batch_size, 
-                patience, model_path='stockformer_model.pth', scheduler=None, show_plot=True):
+                patience, model_path='stockformer_model.pth', scheduler=None, show_plot=False):
     """
     Train model on a single period with early stopping and live loss plotting.
     """
@@ -107,6 +107,9 @@ def train_period(period_data, model, optimizer, criterion, device, num_epochs, b
                 plt.draw()
                 plt.pause(0.01)
     
+    # Add gradient scaler for mixed precision
+    scaler = GradScaler('cuda') if device == 'cuda' else None
+    
     for epoch in range(num_epochs):
         model.train()
         
@@ -131,19 +134,20 @@ def train_period(period_data, model, optimizer, criterion, device, num_epochs, b
 
             optimizer.zero_grad()
             
-            # Forward pass
-            out = model(x_batch, ts_batch)
-
-            # Compute loss
-            loss = criterion(out, y_cla_batch, y_reg_batch)
-
-            # Backward pass
-            loss.backward()
-
-            # Add gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            optimizer.step()
+            # Use autocast for forward pass
+            if scaler is not None:
+                with autocast('cuda'):
+                    out = model(x_batch, ts_batch)
+                    loss = criterion(out, y_cla_batch, y_reg_batch)
+                
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                out = model(x_batch, ts_batch)
+                loss = criterion(out, y_cla_batch, y_reg_batch)
+                loss.backward()
+                optimizer.step()
             
             epoch_loss += loss.item()
             num_batches += 1
@@ -220,6 +224,12 @@ def train_period(period_data, model, optimizer, criterion, device, num_epochs, b
         model.load_state_dict(best_model_state)
         print(f"Loaded best model with validation loss: {best_val_loss:.4f}")
 
+    # Clean up training data
+    del X_train, Y_train, Ts_train, X_val, Y_val, Ts_val
+    if 'X_train_shuffled' in locals():
+        del X_train_shuffled, Y_train_shuffled, Ts_train_shuffled
+    torch.cuda.empty_cache()
+
     if show_plot:
         plt.ioff()
         plt.close(fig)
@@ -236,9 +246,22 @@ def train_on_periods(periods_dataset, model, optimizer, criterion, device, num_e
     initial_wd = weight_decay
     base_patience = 15  # Define a base patience value
     
-    for period_idx, period_data in periods_dataset.items():
+    period_files = sorted([
+        os.path.join('training_periods', fname)
+        for fname in os.listdir('training_periods')
+        if fname.endswith('.pkl')
+    ])
+    import time
+    for period_idx, period_file in enumerate(period_files):
+
+
+        with open(period_file, 'rb') as f:
+            period_data = pickle.load(f)['data']
+
+        print(len(period_data['training']['X']), len(period_data['validation']['X']))
+
         print(f"\nTraining on period {period_idx} with {len(period_data['training']['X'])} training samples and {len(period_data['validation']['X'])} validation samples")
-        
+        start = time.time()
         # Load best model from previous period (except for first period)
         if period_idx > 0:
             try:
@@ -288,8 +311,9 @@ def train_on_periods(periods_dataset, model, optimizer, criterion, device, num_e
         # Pass scheduler to train_period (currently None)
         val_loss = train_period(period_data, model, optimizer, criterion, device, num_epochs, 
                                batch_size, base_patience, model_path, scheduler)
-
-
+        
+        print("-- Period training completed in {:.2f} seconds".format(time.time() - start))
+        
 def main():
 
     # Load config from YAML file
@@ -321,7 +345,7 @@ def main():
     pred_features = model_params.get('pred_features')
 
     # Load data
-    with open(data_path, 'rb') as f:
+    with open('training_periods/period_split_0.pkl', 'rb') as f:
         data = pickle.load(f)
 
     lag = data['seq_len']
@@ -331,7 +355,7 @@ def main():
         raise ValueError("Sequence length mismatch between config and data.")
     if lead != pred_len:
         raise ValueError("Prediction length mismatch between config and data.")
-    period_splits = data['period_splits']
+    #period_splits = data['period_splits']
     tickers = data['tickers']
     num_stocks = len(tickers)
 
@@ -352,14 +376,14 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     criterion = MultiSupervisionLoss(cla_loss_weight)
 
-    print(f"Starting training on {len(period_splits)} periods...")
+    #print(f"Starting training on {len(period_splits)} periods...")
     print(f"Using device: {device}")
     print(f"Reset optimizer between periods: {reset_optimizer}")
     print(f"Learning rate: {learning_rate}")
     print(f"Weight decay: {weight_decay}")
 
     # Train sequentially on periods dataset
-    train_on_periods(period_splits, model, optimizer, criterion, device,
+    train_on_periods(None, model, optimizer, criterion, device,
                     epochs, batch_size, model_path, reset_optimizer, weight_decay)
 
     # Save final model along with config
