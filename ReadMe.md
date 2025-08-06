@@ -29,8 +29,8 @@ This repository contains an implementation of the paper:
 | File | Description | Key Features |
 |------|-------------|--------------|
 | `StockFormer.py` | Main model implementation | Multi-task transformer with price-volume factors, wavelet-based decoupling, dual-frequency encoder/decoder, temporal and stock-wise attention, signal generation |
-| `preprocess.py` | Data preprocessing pipeline | Downloads stock data, creates price/volume features, neutralizes factors by industry/market cap, standardizes per period, generates time series splits for training/validation/test |
-| `train.py` | Model training script | Multi-task loss (regression + classification), sequential period training with optimizer reset and learning rate decay, early stopping, real-time loss visualization |
+| `preprocess.py` | Data preprocessing pipeline | Downloads stock data, creates price/volume features, neutralizes factors by industry/market cap, standardizes per period, generates time series splits saved individually to `training_periods/` directory for memory-efficient training |
+| `train.py` | Model training script | Multi-task loss (regression + classification), sequential period training with memory-efficient loading from `training_periods/`, optimizer reset and learning rate decay between periods, early stopping, real-time loss visualization |
 | `backtest_engine.py` | Backtesting framework | Single-period backtest, portfolio simulation, risk metrics, Sharpe ratio, performance summary, cumulative return plotting, strategy vs baseline comparison |
 | `predict_engine.py` | Inference/prediction script | Loads trained model, prepares latest data, generates and prints trading signals for given tickers |
 
@@ -38,7 +38,8 @@ This repository contains an implementation of the paper:
 
 #### Data Files
 - **`processed_data.csv`** - Raw processed stock data with technical indicators
-- **`period_splits.pkl`** - Time series splits with standardization statistics for training/validation/test
+- **`training_periods/`** - Directory containing individual period splits saved as separate pickle files
+  - `period_split_0.pkl`, `period_split_1.pkl`, etc. - Individual time series splits with standardization statistics
 - **`stockformer_model.pth`** - Trained PyTorch model weights
 
 #### Results & Analysis
@@ -81,13 +82,14 @@ pip install -r requirements.txt
    ```
    - Downloads stock data via yfinance
    - Creates technical indicators and price-volume factors
-   - Generates period splits with proper standardization
+   - Generates period splits saved individually to `training_periods/` directory for memory-efficient access during training
 
 2. **Model Training**
    ```bash
    python train.py --epochs 200 --batch_size 2048
    ```
-   - Trains StockFormer on multi-period data
+   - Trains StockFormer sequentially on individual periods loaded from `training_periods/` directory
+   - Memory-efficient training by loading only one period at a time
    - Real-time loss visualization
    - Saves best model based on validation loss
 
@@ -104,7 +106,7 @@ pip install -r requirements.txt
 ### Training (`train.py`)
 ```bash
 python train.py [OPTIONS]
-  --data          Path to period splits file (default: period_splits.pkl)
+  --data          Path to training periods directory (default: training_periods/)
   --epochs        Number of training epochs (default: 200)
   --batch_size    Training batch size (default: 2048)
   --device        Device to use: cuda/cpu (auto-detected)
@@ -114,7 +116,7 @@ python train.py [OPTIONS]
 ### Backtesting (`backtest_engine.py`)
 ```bash
 python backtest_engine.py [OPTIONS]
-  --data          Path to period splits data (default: period_splits.pkl)
+  --data          Path to training periods directory (default: training_periods/)
   --capital       Initial capital in USD (default: 100000)
   --cost          Transaction cost as decimal (default: 0.001)
   --output        Output plot filename (default: backtest_results.png)
@@ -127,7 +129,7 @@ python backtest_engine.py [OPTIONS]
 2. **Technical Indicators**: Calculates price-volume factors, moving averages, volatility
 3. **Factor Neutralization**: Adjusts for industry and market cap effects
 4. **Standardization**: Z-score normalization with period-specific statistics
-5. **Time Series Splits**: Creates overlapping periods for training/validation/test
+5. **Time Series Splits**: Creates overlapping periods saved individually to `training_periods/` directory for memory-efficient training
 
 ### Generated Features (362 total)
 - **Qlib Alpha360**: 360 technical indicators
@@ -146,11 +148,36 @@ The backtesting engine produces comprehensive performance analysis including:
 
 ## Key Features
 
+- **Memory-Efficient Training**: Individual periods saved separately in `training_periods/` directory, loaded one at a time during training to optimize memory usage
+- **Sequential Period Training**: Model trains on periods sequentially with optimizer reset and learning rate decay between periods
 - **Multi-Task Learning**: Simultaneous regression (returns) and classification (trend direction)
 - **Temporal Attention**: Captures time dependencies in stock price movements
 - **Stock-Wise Attention**: Models inter-stock relationships and correlations
 - **Factor Neutralization**: Industry and market-cap adjusted factors
 - **Realistic Backtesting**: Includes transaction costs, position sizing and exposure limits
+
+## Training Periods Structure
+
+The preprocessing pipeline creates a `training_periods/` directory containing individual pickle files for each time period:
+
+```
+training_periods/
+├── period_split_0.pkl    # First training period
+├── period_split_1.pkl    # Second training period
+├── period_split_2.pkl    # Third training period
+└── ...                   # Additional periods
+```
+
+Each period file contains:
+- **Training data**: Features (X), targets (Y), and time indices (Ts) 
+- **Validation data**: Same structure for model validation
+- **Test data**: Same structure for final evaluation
+- **Metadata**: Tickers, sequence length, prediction length
+
+This structure enables:
+- **Memory efficiency**: Only one period loaded in memory at a time
+- **Scalable training**: Handle large datasets without memory constraints
+- **Flexible period management**: Easy to add/remove specific training periods
 
 ### Data Requirements
 - Stock universe should have consistent trading history
