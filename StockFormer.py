@@ -2,12 +2,8 @@ import torch
 import pywt
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.stats import spearmanr
 import numpy as np
 import math
-import torch._dynamo
-
-#torch.set_float32_matmul_precision('high')
 
 def init_weights(module):
     """Randomly initialize weights for neural network modules."""
@@ -191,47 +187,66 @@ class DualFrequencyEncoder(nn.Module):
 
     def embed_spatial(self, returns):
         # returns: (batch_size, seq_len, num_stocks)
-        # Compute Spearman correlation matrix and use as spatial embedding
-        # More confident with monotonic, non-strictly linear relationships
         batch_size, seq_len, num_stocks = returns.shape
         
-        # Compute correlation for each sample in the batch
+        # Compute correlation for each sample in the batch on GPU
         spatial_embeddings = []
         for b in range(batch_size):
-            corr_matrix = self.compute_spearman_correlation(returns[b])  # (num_stocks, num_stocks)
-            # Convert correlation matrix to spatial embedding
-            spatial_emb = torch.matmul(corr_matrix, self.spatial_embedding)  # (num_stocks, d_model)
+            corr_matrix = self.compute_correlation_gpu(returns[b])  # Keep on GPU
+            spatial_emb = torch.matmul(corr_matrix, self.spatial_embedding)
             spatial_embeddings.append(spatial_emb)
         
-        spatial_embeddings = torch.stack(spatial_embeddings, dim=0)  # (batch_size, num_stocks, d_model)
-        spatial_embeddings = spatial_embeddings.unsqueeze(1).repeat(1, seq_len, 1, 1)  # (batch_size, seq_len, num_stocks, d_model)
+        spatial_embeddings = torch.stack(spatial_embeddings, dim=0)
+        spatial_embeddings = spatial_embeddings.unsqueeze(1).repeat(1, seq_len, 1, 1)
         
         return spatial_embeddings
     
-    @torch._dynamo.disable
+    def embed_spatial_batched(self, returns):
+        # returns: (batch_size, seq_len, num_stocks)
+        batch_size, seq_len, num_stocks = returns.shape
+        
+        # Compute correlation for entire batch at once
+        returns_centered = returns - returns.mean(dim=1, keepdim=True)
+        returns_std = returns_centered.std(dim=1, keepdim=True) + 1e-8
+        returns_normalized = returns_centered / returns_std
+        
+        # Batch matrix multiplication for correlation
+        # returns_normalized: (batch_size, seq_len, num_stocks)
+        # Transpose for batch correlation: (batch_size, num_stocks, seq_len)
+        returns_T = returns_normalized.transpose(1, 2)
+        # Batch correlation: (batch_size, num_stocks, num_stocks)
+        corr_matrices = torch.bmm(returns_T, returns_normalized) / (seq_len - 1)
+        
+        # Clamp and set diagonal
+        corr_matrices = torch.clamp(corr_matrices, -1.0, 1.0)
+        eye = torch.eye(num_stocks, device=returns.device).unsqueeze(0).expand(batch_size, -1, -1)
+        corr_matrices = corr_matrices * (1 - eye) + eye
+        
+        # Apply spatial embedding: (batch_size, num_stocks, d_model)
+        spatial_embeddings = torch.bmm(corr_matrices, self.spatial_embedding.unsqueeze(0).expand(batch_size, -1, -1))
+        spatial_embeddings = spatial_embeddings.unsqueeze(1).repeat(1, seq_len, 1, 1)
+        
+        return spatial_embeddings
+    
     def compute_spearman_correlation(self, returns):
-        # returns: (seq_len, num_stocks)
+        ## returns: (seq_len, num_stocks)
         seq_len, num_stocks = returns.shape
         
-        # Convert to numpy for spearman correlation calculation
-        returns_np = returns.detach().cpu().numpy()
+        # Standardize the returns on GPU
+        returns_centered = returns - returns.mean(dim=0, keepdim=True)
+        returns_std = returns_centered.std(dim=0, keepdim=True) + 1e-8
+        returns_normalized = returns_centered / returns_std
         
-        # Compute spearman correlation matrix
-        try:
-            corr_matrix = np.zeros((num_stocks, num_stocks))
-            for i in range(num_stocks):
-                for j in range(num_stocks):
-                    if i == j:
-                        corr_matrix[i, j] = 1.0
-                    else:
-                        corr, _ = spearmanr(returns_np[:, i], returns_np[:, j])
-                        corr_matrix[i, j] = corr if not np.isnan(corr) else 0.0
-        except:
-            # Fallback to identity matrix if correlation computation fails
-            print("Spearman correlation computation failed, using identity matrix.")
-            corr_matrix = np.eye(num_stocks)
+        # Compute correlation matrix on GPU
+        corr_matrix = torch.mm(returns_normalized.T, returns_normalized) / (seq_len - 1)
         
-        return torch.tensor(corr_matrix, dtype=returns.dtype, device=returns.device)
+        # Clamp to valid correlation range
+        corr_matrix = torch.clamp(corr_matrix, -1.0, 1.0)
+        
+        # Fill diagonal with 1s
+        corr_matrix.fill_diagonal_(1.0)
+        
+        return corr_matrix
        
 
     def forward(self, X_l, X_h, ts_index, returns):
@@ -257,7 +272,7 @@ class DualFrequencyEncoder(nn.Module):
         p_tem = p_tem.unsqueeze(2).repeat(1, 1, num_stocks, 1)  # (batch, seq, num_stocks, d_model)
 
         # Spatial Embedding
-        p_spa = self.embed_spatial(returns)  # (batch, seq, num_stocks, d_model)
+        p_spa = self.embed_spatial_batched(returns)  # GPU-optimized version
         
         # Concat Embeddings
         
@@ -302,7 +317,6 @@ class DualFrequencyFusionDecoder(nn.Module):
 
     def forward(self, X_l_gat, X_h_gat) -> dict:
         # X_l_gat, X_h_gat: (batch_size, seq_len, num_stocks, d_model)
-        # ** Batch first **
         
         # Predictors
         pred_l = self.predictor_l(X_l_gat)  # (batch_size, pred_len, num_stocks, d_model)
@@ -462,8 +476,22 @@ def create_compiled_stockformer(device='cuda', **kwargs):
     Returns:
         Compiled StockFormer model instance.
     """
-    torch.set_float32_matmul_precision("high")
+    #torch.set_float32_matmul_precision("high")
     model = StockFormer(**kwargs)
-    model = torch.compile(model, mode='default')
     model.to(device)
+    
+    # Only use DataParallel if multiple GPUs are available
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+    else:
+        print("Using single GPU")
+    
+    # Compile the model for better performance
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print("Model compiled successfully")
+    except Exception as e:
+        print(f"Model compilation failed: {e}, using non-compiled version")
+    
     return model
